@@ -101,6 +101,11 @@ def read_root():
         }
     }
 
+@app.get("/api/dev/hash")
+async def generate_hash(password: str = "Admin@2024"):
+    hashed = hash_password(password)
+    return {"hash": hashed}
+
 @app.post("/api/applications")
 async def create_application(data: dict):
     url, key = get_supabase()
