@@ -665,7 +665,6 @@ class RegisterBody(BaseModel):
     name: str
     email: str
     password: str
-    role: Optional[str] = "operator"
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -677,6 +676,9 @@ class PasswordChange(BaseModel):
     old_password: str
     new_password: str
 
+class RoleUpdate(BaseModel):
+    role: str
+
 class NotifPrefsUpdate(BaseModel):
     new_application: Optional[bool] = None
     status_changed: Optional[bool] = None
@@ -685,18 +687,53 @@ class NotifPrefsUpdate(BaseModel):
 
 # ── AUTH ENDPOINTS ────────────────────────────────────────────────────────────
 
-@app.post("/api/auth/login")
-async def login(body: LoginBody):
+@app.post("/api/auth/register")
+async def register(body: RegisterBody):
+    """Public registration — creates user with status=pending. Admin must approve."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
-        result = supabase.table("users").select("*").eq("email", body.email).eq("is_active", True).execute()
+        existing = supabase.table("users").select("id").eq("email", body.email).execute()
+        if existing.data:
+            raise HTTPException(status_code=400, detail="Email уже занят")
+        hashed = hash_password(body.password)
+        supabase.table("users").insert({
+            "name": body.name,
+            "email": body.email,
+            "password_hash": hashed,
+            "role": "operator",
+            "status": "pending",
+        }).execute()
+        return {"success": True, "status": "pending"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/auth/login")
+async def login(body: LoginBody):
+    """Login — only approved users can login. Pending/rejected get error message."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        result = supabase.table("users").select("*").eq("email", body.email).execute()
         if not result.data:
             raise HTTPException(status_code=401, detail="Неверный email или пароль")
         user = result.data[0]
         if not verify_password(body.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Неверный email или пароль")
-        supabase.table("users").update({"last_login": datetime.now(timezone.utc).isoformat()}).eq("id", user["id"]).execute()
+        # Check approval status
+        status = user.get("status", "approved")
+        if status == "pending":
+            return {"success": False, "status": "pending",
+                    "message": "Ваша регистрация ожидает подтверждения администратора"}
+        if status == "rejected":
+            return {"success": False, "status": "rejected",
+                    "message": "Ваша регистрация отклонена. Свяжитесь с администратором."}
+        # Approved — issue token
+        supabase.table("users").update({
+            "last_login": datetime.now(timezone.utc).isoformat()
+        }).eq("id", user["id"]).execute()
         token = create_token(user["id"], user["email"], user["role"])
         return {
             "success": True,
@@ -706,37 +743,8 @@ async def login(body: LoginBody):
                 "name": user["name"],
                 "email": user["email"],
                 "role": user["role"],
-                "avatar_url": user.get("avatar_url"),
             }
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.post("/api/auth/register")
-async def register(body: RegisterBody):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        existing = supabase.table("users").select("id").eq("email", body.email).execute()
-        if existing.data:
-            raise HTTPException(status_code=400, detail="Email уже занят")
-        hashed = hash_password(body.password)
-        result = supabase.table("users").insert({
-            "name": body.name,
-            "email": body.email,
-            "password_hash": hashed,
-            "role": body.role,
-        }).execute()
-        user = result.data[0]
-        try:
-            supabase.table("notification_prefs").insert({"user_id": user["id"]}).execute()
-        except Exception:
-            pass
-        return {"success": True, "data": {
-            "id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"],
-        }}
     except HTTPException:
         raise
     except Exception as e:
@@ -754,13 +762,17 @@ async def get_me(request: Request):
         url, key = get_supabase()
         supabase = create_client(url, key)
         result = supabase.table("users").select(
-            "id, name, email, role, avatar_url, last_login, created_at"
+            "id, name, email, role, status, last_login, created_at"
         ).eq("id", user_id).single().execute()
-        prefs = supabase.table("notification_prefs").select("*").eq("user_id", user_id).execute()
+        try:
+            prefs = supabase.table("notification_prefs").select("*").eq("user_id", user_id).execute()
+            notif_prefs = prefs.data[0] if prefs.data else {}
+        except Exception:
+            notif_prefs = {}
         return {
             "success": True,
             "user": result.data,
-            "notification_prefs": prefs.data[0] if prefs.data else {}
+            "notification_prefs": notif_prefs
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -769,12 +781,13 @@ async def get_me(request: Request):
 
 @app.get("/api/users")
 async def get_users():
+    """Admin: get all users with status."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
         result = supabase.table("users").select(
-            "id, name, email, role, is_active, last_login, created_at"
-        ).order("created_at", desc=False).execute()
+            "id, name, email, role, status, last_login, created_at"
+        ).order("created_at", desc=True).execute()
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -787,6 +800,36 @@ async def update_user(id: str, body: UserUpdate):
         updates = {k: v for k, v in body.dict().items() if v is not None}
         result = supabase.table("users").update(updates).eq("id", id).execute()
         return {"success": True, "data": result.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/users/{id}/approve")
+async def approve_user(id: str):
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        supabase.table("users").update({"status": "approved"}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/users/{id}/reject")
+async def reject_user(id: str):
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        supabase.table("users").update({"status": "rejected"}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/users/{id}/role")
+async def change_role(id: str, body: RoleUpdate):
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        supabase.table("users").update({"role": body.role}).eq("id", id).execute()
+        return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -806,24 +849,12 @@ async def change_password(id: str, body: PasswordChange):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-@app.patch("/api/users/{id}/toggle")
-async def toggle_user(id: str):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        user = supabase.table("users").select("is_active").eq("id", id).single().execute()
-        new_status = not user.data["is_active"]
-        supabase.table("users").update({"is_active": new_status}).eq("id", id).execute()
-        return {"success": True, "is_active": new_status}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
 @app.delete("/api/users/{id}")
 async def delete_user(id: str):
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
-        supabase.table("users").update({"is_active": False}).eq("id", id).execute()
+        supabase.table("users").delete().eq("id", id).execute()
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
