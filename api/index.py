@@ -136,6 +136,12 @@ class TransportUpdate(BaseModel):
     last_service: Optional[str] = None
     next_service: Optional[str] = None
 
+class ExpenseCreate(BaseModel):
+    transport_id: str
+    description: str
+    amount: float
+    created_by: str
+
 class VehicleCreate(BaseModel):
     brand: str
     plate: str
@@ -515,6 +521,28 @@ async def patch_transport(id: str, body: TransportUpdate):
         data = {k: v for k, v in body.dict().items() if v is not None}
         return {"success": True, "data": supabase.table("transport").update(data).eq("id", id).execute().data[0]}
     except Exception as e: return {"success": False, "error": str(e)}
+
+# ── TRANSPORT EXPENSES ─────────────────────
+
+@app.get("/api/transport/{id}/expenses")
+async def get_transport_expenses(id: str):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        result = supabase.table("transport_expenses").select("*").eq("transport_id", id).order("created_at", desc=True).execute()
+        return {"success": True, "data": result.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/transport/expenses")
+async def create_transport_expense(body: ExpenseCreate):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        result = supabase.table("transport_expenses").insert(body.dict()).execute()
+        return {"success": True, "data": result.data[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ── OPERATORS CRUD ────────────────────────
 
