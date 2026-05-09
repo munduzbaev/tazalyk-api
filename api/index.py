@@ -65,6 +65,7 @@ class ApplicationCreate(BaseModel):
     institution_name: Optional[str] = None
     user_type: Optional[str] = None
     priority: Optional[str] = "medium"
+    media_url: Optional[str] = None
 
 class ApplicationUpdate(BaseModel):
     status: Optional[str] = None
@@ -229,6 +230,16 @@ async def get_application_by_id(id: str):
         result = supabase.table("applications").select(
             "*, institution:institutions(*), waste_type:waste_types(*)"
         ).eq("id", id).single().execute()
+        return {"success": True, "data": result.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/applications/by-phone/{phone}")
+async def get_applications_by_phone(phone: str):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        result = supabase.table("applications").select("*").eq("phone", phone).order("created_at", desc=True).limit(3).execute()
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
