@@ -223,6 +223,7 @@ async def get_applications(
     priority: Optional[str] = None,
     source: Optional[str] = None,
     unread_only: Optional[bool] = None,
+    limit: Optional[int] = None,
 ):
     url, key = get_supabase()
     supabase = create_client(url, key)
@@ -233,6 +234,7 @@ async def get_applications(
         if priority: query = query.eq("priority", priority)
         if source:   query = query.eq("source", source)
         if unread_only is True: query = query.eq("is_read", False)
+        if limit:    query = query.limit(limit)
 
         result = query.execute()
         return {"success": True, "data": result.data}
