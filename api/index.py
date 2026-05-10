@@ -56,16 +56,14 @@ class MessageCreate(BaseModel):
     type: Optional[str] = "text"
 
 class ApplicationCreate(BaseModel):
-    phone: str
-    address: str
-    description: Optional[str] = None
-    waste_type: Optional[str] = None
+    phone: str                          # номер WhatsApp (обязательно)
+    address: str                        # адрес (обязательно)
+    description: Optional[str] = None  # описание проблемы
+    waste_type: Optional[str] = None   # тип мусора
+    media_url: Optional[str] = None    # ссылка на фото
     source: Optional[str] = "whatsapp"
     status: Optional[str] = "new"
-    institution_name: Optional[str] = None
-    user_type: Optional[str] = None
     priority: Optional[str] = "medium"
-    media_url: Optional[str] = None
 
 class ApplicationUpdate(BaseModel):
     status: Optional[str] = None
@@ -163,6 +161,10 @@ class TelegramNotify(BaseModel):
     chat_id: str
     message: str
 
+class MarkReadBody(BaseModel):
+    ids: Optional[list[str]] = None
+    all: Optional[bool] = False
+
 @app.get("/")
 def read_root():
     url, key = get_supabase()
@@ -178,18 +180,38 @@ def read_root():
 
 @app.post("/api/applications")
 async def create_application_api(body: ApplicationCreate):
-    """Entry point for n8n/WhatsApp/Public forms. Default status: pending_review"""
+    """Entry point for n8n/WhatsApp. Saves application to Supabase."""
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        data = body.dict()
-        if not data.get("status"):
-            data["status"] = "pending_review"
-        if not data.get("priority"):
-            data["priority"] = "medium"
-            
+        data = {
+            "phone":       body.phone,
+            "address":     body.address,
+            "description": body.description or "",
+            "waste_type":  body.waste_type or "",
+            "media_url":   body.media_url or "",
+            "source":      body.source or "whatsapp",
+            "status":      body.status or "new",
+            "priority":    body.priority or "medium",
+        }
         result = supabase.table("applications").insert(data).execute()
         return {"success": True, "data": result.data[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/applications/by-phone/{phone}")
+async def get_applications_by_phone(phone: str):
+    """WhatsApp bot: get last 3 applications by phone number."""
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        result = supabase.table("applications") \
+            .select("id, created_at, address, waste_type, status, media_url") \
+            .eq("phone", phone) \
+            .order("created_at", desc=True) \
+            .limit(3) \
+            .execute()
+        return {"success": True, "applications": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -198,26 +220,41 @@ async def create_application_api(body: ApplicationCreate):
 @app.get("/api/applications")
 async def get_applications(
     status: Optional[str] = None,
-    waste_type_id: Optional[str] = None,
-    institution_id: Optional[str] = None,
     priority: Optional[str] = None,
     source: Optional[str] = None,
+    unread_only: Optional[bool] = None,
 ):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        query = supabase.table("applications").select(
-            "*, institution:institutions(id, name, address), waste_type:waste_types(id, name)"
-        ).order("created_at", desc=True)
+        query = supabase.table("applications").select("*").order("created_at", desc=True)
 
-        if status:         query = query.eq("status", status)
-        if waste_type_id:  query = query.eq("waste_type_id", waste_type_id)
-        if institution_id: query = query.eq("institution_id", institution_id)
-        if priority:       query = query.eq("priority", priority)
-        if source:         query = query.eq("source", source)
+        if status:   query = query.eq("status", status)
+        if priority: query = query.eq("priority", priority)
+        if source:   query = query.eq("source", source)
+        if unread_only is True: query = query.eq("is_read", False)
 
         result = query.execute()
         return {"success": True, "data": result.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/applications/mark-read")
+async def mark_applications_read(body: MarkReadBody):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        query = supabase.table("applications").update({"is_read": True})
+        
+        if body.all:
+            query = query.eq("is_read", False)
+        elif body.ids:
+            query = query.in_("id", body.ids)
+        else:
+            return {"success": True, "updated": 0}
+
+        result = query.execute()
+        return {"success": True, "updated": len(result.data)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -227,19 +264,7 @@ async def get_application_by_id(id: str):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        result = supabase.table("applications").select(
-            "*, institution:institutions(*), waste_type:waste_types(*)"
-        ).eq("id", id).single().execute()
-        return {"success": True, "data": result.data}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.get("/api/applications/by-phone/{phone}")
-async def get_applications_by_phone(phone: str):
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        result = supabase.table("applications").select("*").eq("phone", phone).order("created_at", desc=True).limit(3).execute()
+        result = supabase.table("applications").select("*").eq("id", id).single().execute()
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -409,7 +434,7 @@ async def get_reports_applications(
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        query = supabase.table("applications").select("*, institution:institutions(name), waste_type:waste_types(name)")
+        query = supabase.table("applications").select("*, institution:institutions(name)")
         if status: query = query.eq("status", status)
         if source: query = query.eq("source", source)
         if date_from: query = query.gte("created_at", date_from)
@@ -1049,4 +1074,3 @@ async def update_notif_prefs(id: str, body: NotifPrefsUpdate):
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
-
