@@ -71,6 +71,7 @@ class ApplicationUpdate(BaseModel):
     priority: Optional[str] = None
     description: Optional[str] = None
     address: Optional[str] = None
+    vehicle_id: Optional[str] = None
 
 class InstitutionCreate(BaseModel):
     name: str
@@ -228,7 +229,9 @@ async def get_applications(
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        query = supabase.table("applications").select("*").order("created_at", desc=True)
+        query = supabase.table("applications") \
+            .select("*, transport:transport(name, plate)") \
+            .order("created_at", desc=True)
 
         if status:   query = query.eq("status", status)
         if priority: query = query.eq("priority", priority)
@@ -266,7 +269,11 @@ async def get_application_by_id(id: str):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        result = supabase.table("applications").select("*").eq("id", id).single().execute()
+        result = supabase.table("applications") \
+            .select("*, transport:transport(name, plate)") \
+            .eq("id", id) \
+            .single() \
+            .execute()
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
