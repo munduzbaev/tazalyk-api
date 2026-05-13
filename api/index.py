@@ -230,7 +230,7 @@ async def get_applications(
     supabase = create_client(url, key)
     try:
         query = supabase.table("applications") \
-            .select("*, transport:transport(name, plate)") \
+            .select("*") \
             .order("created_at", desc=True)
 
         if status:   query = query.eq("status", status)
@@ -364,7 +364,7 @@ async def get_sched():
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name), transport:transport(name, plate)").execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*").execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/schedules/tomorrow")
@@ -373,7 +373,7 @@ async def get_sched_tomorrow():
     supabase = create_client(url, key)
     try:
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name), transport:transport(name, plate)").eq("next_pickup", tomorrow).execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*").eq("next_pickup", tomorrow).execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.post("/api/schedules")
@@ -515,7 +515,7 @@ async def get_reports_schedule():
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name), transport:transport(name, plate)").execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*").execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 # ── TELEGRAM ─────────────────────────────
@@ -655,7 +655,7 @@ async def get_analytics():
     
     supabase = create_client(url, key)
     try:
-        all_apps = supabase.table("applications").select("id, status, source, priority, created_at, waste_type_id").execute()
+        all_apps = supabase.table("applications").select("id, status, source, priority, created_at, waste_type").execute()
         data = all_apps.data or []
 
         total = len(data)
