@@ -11,9 +11,20 @@ app = FastAPI()
 
 from fastapi.middleware.cors import CORSMiddleware
 
+ALLOWED_ORIGINS = [
+    "https://kara-suu-tazalyk.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+# Allow extra origins via env (n8n, preview deploys)
+_extra = os.environ.get("EXTRA_CORS_ORIGINS", "")
+if _extra:
+    ALLOWED_ORIGINS += [o.strip() for o in _extra.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",  # preview deploys
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -143,6 +154,7 @@ class ExpenseCreate(BaseModel):
     created_by: str
 
 class VehicleCreate(BaseModel):
+    """Deprecated — kept only for backward-compat with any legacy callers."""
     brand: str
     plate: str
     type: str
@@ -151,6 +163,7 @@ class VehicleCreate(BaseModel):
     notes: Optional[str] = None
 
 class VehicleUpdate(BaseModel):
+    """Deprecated."""
     brand: Optional[str] = None
     plate: Optional[str] = None
     type: Optional[str] = None
@@ -394,42 +407,9 @@ async def patch_sched(id: str, body: ScheduleUpdate):
         return {"success": True, "data": supabase.table("schedules").update(data).eq("id", id).execute().data[0]}
     except Exception as e: return {"success": False, "error": str(e)}
 
-# ── VEHICLES ─────────────────────────────
-
-@app.get("/api/vehicles")
-async def get_vehicles():
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        return {"success": True, "data": supabase.table("vehicles").select("*").order("plate").execute().data}
-    except Exception as e: return {"success": False, "error": str(e)}
-
-@app.post("/api/vehicles")
-async def create_vehicle(body: VehicleCreate):
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        data = {k: v for k, v in body.dict().items() if v is not None}
-        return {"success": True, "data": supabase.table("vehicles").insert(data).execute().data[0]}
-    except Exception as e: return {"success": False, "error": str(e)}
-
-@app.patch("/api/vehicles/{id}")
-async def update_vehicle(id: str, body: VehicleUpdate):
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        data = {k: v for k, v in body.dict().items() if v is not None}
-        return {"success": True, "data": supabase.table("vehicles").update(data).eq("id", id).execute().data[0]}
-    except Exception as e: return {"success": False, "error": str(e)}
-
-@app.delete("/api/vehicles/{id}")
-async def delete_vehicle(id: str):
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        supabase.table("vehicles").delete().eq("id", id).execute()
-        return {"success": True}
-    except Exception as e: return {"success": False, "error": str(e)}
+# ── VEHICLES (DEPRECATED) ─────────────────────────
+# /api/vehicles/* endpoints removed — use /api/transport/* instead.
+# The legacy 'vehicles' table is no longer used by the dashboard.
 
 # ── REPORTS ─────────────────────────────
 
@@ -589,61 +569,9 @@ async def create_transport_expense(body: ExpenseCreate):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ── OPERATORS CRUD ────────────────────────
-
-class OperatorCreate(BaseModel):
-    name: str
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    role: Optional[str] = "operator"
-
-class OperatorUpdate(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    role: Optional[str] = None
-    is_active: Optional[bool] = None
-
-@app.get("/api/operators")
-async def get_operators():
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        result = supabase.table("operators").select("*").execute()
-        return {"success": True, "data": result.data}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.post("/api/operators")
-async def create_operator(body: OperatorCreate):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        result = supabase.table("operators").insert(body.dict()).execute()
-        return {"success": True, "data": result.data}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.patch("/api/operators/{id}")
-async def update_operator(id: str, body: OperatorUpdate):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        updates = {k: v for k, v in body.dict().items() if v is not None}
-        result = supabase.table("operators").update(updates).eq("id", id).execute()
-        return {"success": True, "data": result.data}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.delete("/api/operators/{id}")
-async def delete_operator(id: str):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        supabase.table("operators").update({"is_active": False}).eq("id", id).execute()
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+# ── OPERATORS (DEPRECATED) ────────────────────────
+# /api/operators/* endpoints removed — use /api/users/* instead.
+# Operators live in the 'users' table with role='operator'.
 
 # ── ANALYTICS ─────────────────────────────────────────────
 
@@ -865,6 +793,131 @@ async def update_organization(id: str, body: OrgUpdate):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+# ── REFUSAL WORKFLOW (operator → admin approval) ───────────────────────────
+
+@app.post("/api/applications/{id}/reject")
+async def reject_application(id: str, body: RefusalCreate):
+    """Operator initiates client refusal. Status -> pending_admin_approval.
+    Releases assigned transport (if any) back to 'available'."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        # Fetch current app to know vehicle_id
+        cur = supabase.table("applications").select("vehicle_id").eq("id", id).single().execute()
+        vehicle_id = cur.data.get("vehicle_id") if cur.data else None
+        updates = {
+            "status": "pending_admin_approval",
+            "refusal_notes": body.refusal_notes,
+            "refused_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if body.operator_id:
+            updates["refused_by_operator_id"] = body.operator_id
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        # Release transport
+        if vehicle_id:
+            try:
+                supabase.table("transport").update({
+                    "status": "available",
+                    "current_task": None
+                }).eq("id", vehicle_id).execute()
+            except Exception:
+                pass
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/applications/{id}/signature")
+async def attach_refusal_signature(id: str, body: RefusalSignature):
+    """Driver attaches refusal signature from mini-app. Doesn't change status —
+    signature is just metadata that admin can review before approving."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        updates = {"refusal_signature_url": body.signature_url}
+        if body.lat is not None:
+            updates["refused_lat"] = body.lat
+        if body.lng is not None:
+            updates["refused_lng"] = body.lng
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/applications/{id}/refusal/approve")
+async def approve_refusal(id: str, body: RefusalDecision):
+    """Admin approves the refusal. Final status -> cancelled."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        updates = {
+            "status": "cancelled",
+            "refusal_approved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if body.approver_id:
+            updates["refusal_approved_by"] = body.approver_id
+        if body.admin_note:
+            # Append admin note to refusal_notes
+            cur = supabase.table("applications").select("refusal_notes").eq("id", id).single().execute()
+            prev = (cur.data or {}).get("refusal_notes") or ""
+            updates["refusal_notes"] = f"{prev}\n\n[Админ] {body.admin_note}".strip()
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/applications/{id}/refusal/return")
+async def return_refusal(id: str, body: RefusalDecision):
+    """Admin returns the refusal to the operator (rejects the refusal)."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        target_status = body.return_to_status or "in_progress"
+        updates = {"status": target_status}
+        if body.admin_note:
+            cur = supabase.table("applications").select("refusal_notes").eq("id", id).single().execute()
+            prev = (cur.data or {}).get("refusal_notes") or ""
+            updates["refusal_notes"] = f"{prev}\n\n[Админ возврат] {body.admin_note}".strip()
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ── SCHEDULE COMPLETE ─────────────────────────────
+
+@app.patch("/api/schedules/{id}/complete")
+async def complete_schedule(id: str):
+    """Mark a scheduled pickup as completed for today.
+    Sets last_completed = now and bumps next_pickup forward by interval (if interval set)."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        cur = supabase.table("schedules").select("interval_type, interval_value, next_pickup").eq("id", id).single().execute()
+        row = cur.data or {}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        updates = {"last_completed": now_iso, "last_pickup": datetime.now(timezone.utc).date().isoformat()}
+        # Advance next_pickup if we know interval
+        itype = row.get("interval_type")
+        ival = row.get("interval_value")
+        try:
+            ival_n = int(ival) if ival is not None else None
+        except (TypeError, ValueError):
+            ival_n = None
+        base = datetime.now(timezone.utc)
+        if itype == "daily":
+            next_d = base + timedelta(days=ival_n or 1)
+        elif itype == "weekly":
+            next_d = base + timedelta(weeks=ival_n or 1)
+        elif itype == "monthly":
+            next_d = base + timedelta(days=30 * (ival_n or 1))
+        else:
+            next_d = None
+        if next_d:
+            updates["next_pickup"] = next_d.date().isoformat()
+        result = supabase.table("schedules").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # ── AUTH MODELS ───────────────────────────────────────────────────────────────
 
 class LoginBody(BaseModel):
@@ -875,6 +928,8 @@ class RegisterBody(BaseModel):
     name: str
     email: str
     password: str
+    role: Optional[str] = "operator"
+    phone: Optional[str] = None
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -895,11 +950,29 @@ class NotifPrefsUpdate(BaseModel):
     urgent_application: Optional[bool] = None
     system_update: Optional[bool] = None
 
+class RefusalCreate(BaseModel):
+    """Operator initiates client refusal — requires notes."""
+    refusal_notes: str
+    operator_id: Optional[str] = None
+
+class RefusalSignature(BaseModel):
+    """Driver attaches signature from mini-app."""
+    signature_url: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class RefusalDecision(BaseModel):
+    """Admin approves or returns refusal."""
+    approver_id: Optional[str] = None
+    admin_note: Optional[str] = None
+    return_to_status: Optional[str] = "in_progress"  # used only on return
+
 # ── AUTH ENDPOINTS ────────────────────────────────────────────────────────────
 
 @app.post("/api/auth/register")
 async def register(body: RegisterBody):
-    """Public registration — creates user with status=pending. Admin must approve."""
+    """Public registration. Self-signup is always pending+operator.
+    When called by an admin (with role/phone), creates immediately with given role (still pending until approved)."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
@@ -907,14 +980,28 @@ async def register(body: RegisterBody):
         if existing.data:
             raise HTTPException(status_code=400, detail="Email уже занят")
         hashed = hash_password(body.password)
-        supabase.table("users").insert({
+        role = body.role if body.role in ("operator", "admin", "super_admin") else "operator"
+        new_user = {
             "name": body.name,
             "email": body.email,
             "password_hash": hashed,
-            "role": "operator",
+            "role": role,
             "status": "pending",
-        }).execute()
-        return {"success": True, "status": "pending"}
+        }
+        if body.phone:
+            new_user["phone"] = body.phone
+        result = supabase.table("users").insert(new_user).execute()
+        created = result.data[0] if result.data else None
+        return {
+            "success": True,
+            "status": "pending",
+            "user": {
+                "id": created["id"] if created else None,
+                "name": created["name"] if created else body.name,
+                "email": created["email"] if created else body.email,
+                "role": created["role"] if created else role,
+            } if created else None,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -1036,10 +1123,14 @@ async def reject_user(id: str):
 @app.patch("/api/users/{id}/role")
 async def change_role(id: str, body: RoleUpdate):
     try:
+        if body.role not in ("operator", "admin", "super_admin"):
+            raise HTTPException(status_code=400, detail="Недопустимая роль")
         url, key = get_supabase()
         supabase = create_client(url, key)
         supabase.table("users").update({"role": body.role}).eq("id", id).execute()
         return {"success": True}
+    except HTTPException:
+        raise
     except Exception as e:
         return {"success": False, "error": str(e)}
 
