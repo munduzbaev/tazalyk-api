@@ -179,6 +179,23 @@ class MarkReadBody(BaseModel):
     ids: Optional[list[str]] = None
     all: Optional[bool] = False
 
+class RefusalCreate(BaseModel):
+    """Operator initiates client refusal — requires notes."""
+    refusal_notes: str
+    operator_id: Optional[str] = None
+
+class RefusalSignature(BaseModel):
+    """Driver attaches signature from mini-app."""
+    signature_url: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class RefusalDecision(BaseModel):
+    """Admin approves or returns refusal."""
+    approver_id: Optional[str] = None
+    admin_note: Optional[str] = None
+    return_to_status: Optional[str] = "in_progress"  # used only on return
+
 @app.get("/")
 def read_root():
     url, key = get_supabase()
@@ -949,23 +966,6 @@ class NotifPrefsUpdate(BaseModel):
     status_changed: Optional[bool] = None
     urgent_application: Optional[bool] = None
     system_update: Optional[bool] = None
-
-class RefusalCreate(BaseModel):
-    """Operator initiates client refusal — requires notes."""
-    refusal_notes: str
-    operator_id: Optional[str] = None
-
-class RefusalSignature(BaseModel):
-    """Driver attaches signature from mini-app."""
-    signature_url: str
-    lat: Optional[float] = None
-    lng: Optional[float] = None
-
-class RefusalDecision(BaseModel):
-    """Admin approves or returns refusal."""
-    approver_id: Optional[str] = None
-    admin_note: Optional[str] = None
-    return_to_status: Optional[str] = "in_progress"  # used only on return
 
 # ── AUTH ENDPOINTS ────────────────────────────────────────────────────────────
 
