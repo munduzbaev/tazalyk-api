@@ -87,9 +87,15 @@ class ApplicationUpdate(BaseModel):
 class InstitutionCreate(BaseModel):
     name: str
     address: Optional[str] = None
-    type: Optional[str] = None
     contact_person: Optional[str] = None
-    phone: Optional[str] = None
+    contact_phone: Optional[str] = None
+
+class InstitutionUpdate(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    is_active: Optional[bool] = None
 
 class WasteTypeCreate(BaseModel):
     name: str
@@ -349,11 +355,14 @@ async def post_app_message(id: str, body: MessageCreate):
 # ── DIRECTORIES ────────────────────────────
 
 @app.get("/api/institutions")
-async def get_inst():
+async def get_inst(include_inactive: Optional[bool] = False):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("institutions").select("*").order("name").execute().data}
+        q = supabase.table("institutions").select("*").order("name")
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        return {"success": True, "data": q.execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.post("/api/institutions")
@@ -361,7 +370,38 @@ async def create_inst(body: InstitutionCreate):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("institutions").insert(body.dict()).execute().data[0]}
+        data = {k: v for k, v in body.dict().items() if v is not None}
+        return {"success": True, "data": supabase.table("institutions").insert(data).execute().data[0]}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.patch("/api/institutions/{id}")
+async def update_inst(id: str, body: InstitutionUpdate):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        data = {k: v for k, v in body.dict().items() if v is not None}
+        result = supabase.table("institutions").update(data).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.delete("/api/institutions/{id}")
+async def delete_inst(id: str):
+    """Soft delete — set is_active=false. Use ?hard=true to actually DELETE."""
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("institutions").update({"is_active": False}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.post("/api/institutions/{id}/restore")
+async def restore_inst(id: str):
+    """Reactivate soft-deleted institution."""
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("institutions").update({"is_active": True}).eq("id", id).execute()
+        return {"success": True}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/waste_types")
@@ -525,11 +565,42 @@ async def notify_telegram(body: TelegramNotify):
 # ── TRANSPORT ──────────────────────────────
 
 @app.get("/api/transport")
-async def get_transport_list():
+async def get_transport_list(include_inactive: Optional[bool] = False):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("transport").select("*").order("name").execute().data}
+        q = supabase.table("transport").select("*").order("name")
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        return {"success": True, "data": q.execute().data}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.post("/api/transport")
+async def create_transport(body: TransportCreate):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        data = {k: v for k, v in body.dict().items() if v is not None}
+        return {"success": True, "data": supabase.table("transport").insert(data).execute().data[0]}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.delete("/api/transport/{id}")
+async def delete_transport(id: str):
+    """Soft delete — set is_active=false. Preserves FKs from applications/schedules."""
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("transport").update({"is_active": False}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.post("/api/transport/{id}/restore")
+async def restore_transport(id: str):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("transport").update({"is_active": True}).eq("id", id).execute()
+        return {"success": True}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/transport/{id}")
@@ -1058,14 +1129,17 @@ async def get_me(request: Request):
 # ── USER MANAGEMENT ───────────────────────────────────────────────────────────
 
 @app.get("/api/users")
-async def get_users():
-    """Admin: get all users with status."""
+async def get_users(include_inactive: Optional[bool] = False):
+    """Admin: get all users with status. By default excludes soft-deleted."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
-        result = supabase.table("users").select(
-            "id, name, email, role, status, last_login, created_at"
-        ).order("created_at", desc=True).execute()
+        q = supabase.table("users").select(
+            "id, name, email, role, status, phone, is_active, last_login, created_at"
+        ).order("created_at", desc=True)
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        result = q.execute()
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1133,10 +1207,23 @@ async def change_password(id: str, body: PasswordChange):
 
 @app.delete("/api/users/{id}")
 async def delete_user(id: str):
+    """Soft delete — set is_active=false. Preserves foreign keys from
+    historical applications / messages."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
-        supabase.table("users").delete().eq("id", id).execute()
+        supabase.table("users").update({"is_active": False}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/users/{id}/restore")
+async def restore_user(id: str):
+    """Reactivate soft-deleted user."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        supabase.table("users").update({"is_active": True}).eq("id", id).execute()
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
