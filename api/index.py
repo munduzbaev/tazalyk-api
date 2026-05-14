@@ -96,32 +96,19 @@ class WasteTypeCreate(BaseModel):
     color: Optional[str] = None
 
 class ScheduleCreate(BaseModel):
-    institution_id: Optional[str] = None
-    transport_id: Optional[str] = None
-    day_of_week: Optional[int] = None
-    time_slot: Optional[str] = None
-    object_name: Optional[str] = None
-    address: Optional[str] = None
-    phone: Optional[str] = None
-    next_pickup: Optional[str] = None
-    interval_type: Optional[str] = None
-    interval_value: Optional[str] = None
-    last_pickup: Optional[str] = None
-    notes: Optional[str] = None
+    institution_id: str
+    vehicle_id: Optional[str] = None
+    waste_type_id: Optional[str] = None
+    interval_days: Optional[int] = 7
+    next_run_at: Optional[str] = None  # date string
 
 class ScheduleUpdate(BaseModel):
     institution_id: Optional[str] = None
-    transport_id: Optional[str] = None
-    day_of_week: Optional[int] = None
-    time_slot: Optional[str] = None
-    object_name: Optional[str] = None
-    address: Optional[str] = None
-    phone: Optional[str] = None
-    next_pickup: Optional[str] = None
-    interval_type: Optional[str] = None
-    interval_value: Optional[str] = None
-    last_pickup: Optional[str] = None
-    notes: Optional[str] = None
+    vehicle_id: Optional[str] = None
+    waste_type_id: Optional[str] = None
+    interval_days: Optional[int] = None
+    next_run_at: Optional[str] = None
+    last_run_at: Optional[str] = None
 
 class TransportCreate(BaseModel):
     name: str
@@ -394,7 +381,7 @@ async def get_sched():
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("schedules").select("*").execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address), transport:transport(name, plate), waste_type:waste_types(name)").execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/schedules/tomorrow")
@@ -403,7 +390,7 @@ async def get_sched_tomorrow():
     supabase = create_client(url, key)
     try:
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        return {"success": True, "data": supabase.table("schedules").select("*").eq("next_pickup", tomorrow).execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address), transport:transport(name, plate), waste_type:waste_types(name)").eq("next_run_at", tomorrow).execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.post("/api/schedules")
@@ -903,33 +890,27 @@ async def return_refusal(id: str, body: RefusalDecision):
 
 @app.patch("/api/schedules/{id}/complete")
 async def complete_schedule(id: str):
-    """Mark a scheduled pickup as completed for today.
-    Sets last_completed = now and bumps next_pickup forward by interval (if interval set)."""
+    """Mark a scheduled pickup as completed today.
+    Sets last_completed + last_run_at = now, and advances next_run_at
+    by interval_days (if interval_days > 0)."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
-        cur = supabase.table("schedules").select("interval_type, interval_value, next_pickup").eq("id", id).single().execute()
+        cur = supabase.table("schedules").select("interval_days, next_run_at").eq("id", id).single().execute()
         row = cur.data or {}
-        now_iso = datetime.now(timezone.utc).isoformat()
-        updates = {"last_completed": now_iso, "last_pickup": datetime.now(timezone.utc).date().isoformat()}
-        # Advance next_pickup if we know interval
-        itype = row.get("interval_type")
-        ival = row.get("interval_value")
+        now_dt = datetime.now(timezone.utc)
+        today_date = now_dt.date().isoformat()
+        updates = {
+            "last_completed": now_dt.isoformat(),
+            "last_run_at": today_date,
+        }
+        # Advance next_run_at if interval is set
         try:
-            ival_n = int(ival) if ival is not None else None
+            days = int(row.get("interval_days") or 0)
         except (TypeError, ValueError):
-            ival_n = None
-        base = datetime.now(timezone.utc)
-        if itype == "daily":
-            next_d = base + timedelta(days=ival_n or 1)
-        elif itype == "weekly":
-            next_d = base + timedelta(weeks=ival_n or 1)
-        elif itype == "monthly":
-            next_d = base + timedelta(days=30 * (ival_n or 1))
-        else:
-            next_d = None
-        if next_d:
-            updates["next_pickup"] = next_d.date().isoformat()
+            days = 0
+        if days > 0:
+            updates["next_run_at"] = (now_dt + timedelta(days=days)).date().isoformat()
         result = supabase.table("schedules").update(updates).eq("id", id).execute()
         return {"success": True, "data": result.data[0] if result.data else None}
     except Exception as e:
