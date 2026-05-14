@@ -421,7 +421,7 @@ async def get_sched():
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address), transport:transport(name, plate), waste_type:waste_types(name)").execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address, contact_phone), transport:transport(name, plate, type), waste_type:waste_types(name)").execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/schedules/tomorrow")
@@ -430,7 +430,7 @@ async def get_sched_tomorrow():
     supabase = create_client(url, key)
     try:
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address), transport:transport(name, plate), waste_type:waste_types(name)").eq("next_run_at", tomorrow).execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address, contact_phone), transport:transport(name, plate, type), waste_type:waste_types(name)").eq("next_run_at", tomorrow).execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.post("/api/schedules")
