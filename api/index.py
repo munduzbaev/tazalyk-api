@@ -1242,3 +1242,280 @@ async def update_notif_prefs(id: str, body: NotifPrefsUpdate):
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DRIVER WORKFLOW (iter3)
+# ═══════════════════════════════════════════════════════════════════════════
+# Three endpoints that mediate between admin UI / n8n Telegram bot / DB:
+#  1. POST /api/transport/register        — driver binds Telegram chat_id by phone
+#  2. POST /api/applications/{id}/assign  — operator assigns vehicle, fires webhook
+#  3. POST /api/applications/{id}/driver-action — driver accepts/refuses/completes
+#
+# Architecture: API is the single source of truth.
+# n8n never writes to Supabase directly; it only calls these endpoints.
+
+import re as _re
+
+def _normalize_phone_kg(raw):
+    """Return canonical 996XXXXXXXXX or None."""
+    if not raw:
+        return None
+    digits = _re.sub(r"\D", "", str(raw))
+    if not digits:
+        return None
+    if len(digits) == 12 and digits.startswith("996"):
+        return digits
+    if len(digits) == 10 and digits[0] in ("0", "8"):
+        return "996" + digits[1:]
+    if len(digits) == 9:
+        return "996" + digits
+    return None
+
+
+def _trigger_n8n_webhook(payload):
+    """Fire-and-forget POST to n8n driver-assign webhook.
+    Returns (ok: bool, err: Optional[str]). Does not raise.
+    """
+    url = os.environ.get("N8N_DRIVER_ASSIGN_WEBHOOK_URL")
+    if not url:
+        return False, "N8N_DRIVER_ASSIGN_WEBHOOK_URL not configured"
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as res:
+            res.read()  # drain
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+# ── 1. Driver registration ─────────────────────────────────────────────────
+
+class DriverRegister(BaseModel):
+    phone: str
+    telegram_chat_id: int
+    telegram_username: Optional[str] = None
+
+
+@app.post("/api/transport/register")
+async def driver_register(body: DriverRegister):
+    """Bind a Telegram chat_id to a transport record by matching driver_phone.
+
+    Called by n8n when driver sends `/start <phone>` to the bot.
+    """
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        phone = _normalize_phone_kg(body.phone)
+        if not phone:
+            return {"success": False, "error": "invalid_phone"}
+
+        match = (
+            supabase.table("transport")
+            .select("id, name, plate, driver_name, driver_phone, is_active")
+            .eq("driver_phone", phone)
+            .execute()
+        )
+        rows = match.data or []
+        rows = [r for r in rows if r.get("is_active") in (True, None)]
+        if not rows:
+            return {"success": False, "error": "phone_not_found"}
+
+        t = rows[0]
+        updates = {
+            "telegram_chat_id": str(body.telegram_chat_id),
+            "telegram_username": body.telegram_username,
+            "telegram_linked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("transport").update(updates).eq("id", t["id"]).execute()
+        return {
+            "success": True,
+            "data": {
+                "id": t["id"],
+                "name": t.get("name"),
+                "plate": t.get("plate"),
+                "driver_name": t.get("driver_name"),
+            },
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── 2. Assign vehicle to application ───────────────────────────────────────
+
+class AssignVehicle(BaseModel):
+    vehicle_id: str
+
+
+@app.post("/api/applications/{id}/assign")
+async def assign_vehicle(id: str, body: AssignVehicle):
+    """Operator assigns a vehicle to an application.
+
+    Side effects: sets status='assigned', records assigned_at,
+    fires webhook to n8n which will notify the driver in Telegram.
+    """
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        # Verify transport exists and is active
+        t = (
+            supabase.table("transport")
+            .select("id, name, plate, telegram_chat_id, driver_name, is_active")
+            .eq("id", body.vehicle_id)
+            .single()
+            .execute()
+        )
+        if not t.data:
+            return {"success": False, "error": "vehicle_not_found"}
+        if t.data.get("is_active") is False:
+            return {"success": False, "error": "vehicle_inactive"}
+
+        # Update application
+        now_iso = datetime.now(timezone.utc).isoformat()
+        result = (
+            supabase.table("applications")
+            .update({
+                "vehicle_id": body.vehicle_id,
+                "status": "assigned",
+                "assigned_at": now_iso,
+            })
+            .eq("id", id)
+            .execute()
+        )
+        if not result.data:
+            return {"success": False, "error": "application_not_found"}
+
+        # Fire webhook to n8n (non-blocking semantics — we don't fail the assign
+        # if webhook is down; the driver can be reached by phone in that case)
+        webhook_ok, webhook_err = _trigger_n8n_webhook({
+            "application_id": id,
+            "vehicle_id": body.vehicle_id,
+            "has_telegram": bool(t.data.get("telegram_chat_id")),
+        })
+
+        return {
+            "success": True,
+            "data": result.data[0] if result.data else None,
+            "webhook": {"ok": webhook_ok, "error": webhook_err},
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── 3. Driver action (accept / refuse / complete) ──────────────────────────
+
+class DriverAction(BaseModel):
+    action: str  # 'accept' | 'refuse' | 'complete'
+    telegram_chat_id: int
+
+
+@app.post("/api/applications/{id}/driver-action")
+async def driver_action(id: str, body: DriverAction):
+    """Driver presses a button in Telegram. Validates that the chat_id
+    matches the transport assigned to this application, then transitions
+    status accordingly.
+
+    accept   : assigned  → accepted
+    refuse   : assigned  → new (returns to operators' queue, vehicle_id cleared)
+    complete : accepted  → completed (also shifts schedule.next_run_at)
+    """
+    if body.action not in ("accept", "refuse", "complete"):
+        return {"success": False, "error": "invalid_action"}
+
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        # Fetch application + its assigned transport
+        app_row = (
+            supabase.table("applications")
+            .select("id, status, vehicle_id, institution_id")
+            .eq("id", id)
+            .single()
+            .execute()
+        )
+        if not app_row.data:
+            return {"success": False, "error": "application_not_found"}
+        a = app_row.data
+        if not a.get("vehicle_id"):
+            return {"success": False, "error": "no_vehicle_assigned"}
+
+        # Verify the driver pressing the button owns the assigned vehicle
+        t = (
+            supabase.table("transport")
+            .select("id, telegram_chat_id, name, plate")
+            .eq("id", a["vehicle_id"])
+            .single()
+            .execute()
+        )
+        if not t.data:
+            return {"success": False, "error": "vehicle_not_found"}
+        expected_chat = t.data.get("telegram_chat_id")
+        if not expected_chat or str(expected_chat) != str(body.telegram_chat_id):
+            return {"success": False, "error": "chat_id_mismatch"}
+
+        # Compute state transition
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if body.action == "accept":
+            if a["status"] != "assigned":
+                return {"success": False, "error": "invalid_state", "current_status": a["status"]}
+            updates = {"status": "accepted", "accepted_at": now_iso}
+        elif body.action == "refuse":
+            if a["status"] not in ("assigned", "accepted"):
+                return {"success": False, "error": "invalid_state", "current_status": a["status"]}
+            updates = {
+                "status": "new",
+                "vehicle_id": None,
+                "assigned_at": None,
+                "accepted_at": None,
+            }
+        else:  # complete
+            if a["status"] not in ("accepted", "assigned"):
+                return {"success": False, "error": "invalid_state", "current_status": a["status"]}
+            updates = {"status": "completed", "completed_at": now_iso}
+
+        upd_result = (
+            supabase.table("applications").update(updates).eq("id", id).execute()
+        )
+
+        # If completed and application is tied to an institution, advance the schedule
+        schedule_advanced = None
+        if body.action == "complete" and a.get("institution_id"):
+            sch = (
+                supabase.table("schedules")
+                .select("id, next_run_at, interval_days")
+                .eq("institution_id", a["institution_id"])
+                .execute()
+            )
+            if sch.data:
+                # Advance every schedule for this institution that's due on/before today
+                today = datetime.now(timezone.utc).date()
+                advanced_ids = []
+                for s in sch.data:
+                    nxt = s.get("next_run_at")
+                    ival = s.get("interval_days") or 7
+                    if not nxt:
+                        continue
+                    try:
+                        cur = datetime.fromisoformat(nxt.replace("Z", "+00:00")).date()
+                    except Exception:
+                        continue
+                    if cur <= today:
+                        new_next = cur + timedelta(days=int(ival))
+                        supabase.table("schedules").update({
+                            "next_run_at": new_next.isoformat(),
+                            "last_completed": now_iso,
+                            "last_run_at": now_iso,
+                        }).eq("id", s["id"]).execute()
+                        advanced_ids.append(s["id"])
+                schedule_advanced = advanced_ids or None
+
+        return {
+            "success": True,
+            "data": upd_result.data[0] if upd_result.data else None,
+            "schedule_advanced": schedule_advanced,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
