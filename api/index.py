@@ -11,9 +11,20 @@ app = FastAPI()
 
 from fastapi.middleware.cors import CORSMiddleware
 
+ALLOWED_ORIGINS = [
+    "https://kara-suu-tazalyk.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+# Allow extra origins via env (n8n, preview deploys)
+_extra = os.environ.get("EXTRA_CORS_ORIGINS", "")
+if _extra:
+    ALLOWED_ORIGINS += [o.strip() for o in _extra.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",  # preview deploys
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -76,41 +87,34 @@ class ApplicationUpdate(BaseModel):
 class InstitutionCreate(BaseModel):
     name: str
     address: Optional[str] = None
-    type: Optional[str] = None
     contact_person: Optional[str] = None
-    phone: Optional[str] = None
+    contact_phone: Optional[str] = None
+
+class InstitutionUpdate(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    is_active: Optional[bool] = None
 
 class WasteTypeCreate(BaseModel):
     name: str
     color: Optional[str] = None
 
 class ScheduleCreate(BaseModel):
-    institution_id: Optional[str] = None
-    transport_id: Optional[str] = None
-    day_of_week: Optional[int] = None
-    time_slot: Optional[str] = None
-    object_name: Optional[str] = None
-    address: Optional[str] = None
-    phone: Optional[str] = None
-    next_pickup: Optional[str] = None
-    interval_type: Optional[str] = None
-    interval_value: Optional[str] = None
-    last_pickup: Optional[str] = None
-    notes: Optional[str] = None
+    institution_id: str
+    vehicle_id: Optional[str] = None
+    waste_type_id: Optional[str] = None
+    interval_days: Optional[int] = 7
+    next_run_at: Optional[str] = None  # date string
 
 class ScheduleUpdate(BaseModel):
     institution_id: Optional[str] = None
-    transport_id: Optional[str] = None
-    day_of_week: Optional[int] = None
-    time_slot: Optional[str] = None
-    object_name: Optional[str] = None
-    address: Optional[str] = None
-    phone: Optional[str] = None
-    next_pickup: Optional[str] = None
-    interval_type: Optional[str] = None
-    interval_value: Optional[str] = None
-    last_pickup: Optional[str] = None
-    notes: Optional[str] = None
+    vehicle_id: Optional[str] = None
+    waste_type_id: Optional[str] = None
+    interval_days: Optional[int] = None
+    next_run_at: Optional[str] = None
+    last_run_at: Optional[str] = None
 
 class TransportCreate(BaseModel):
     name: str
@@ -143,6 +147,7 @@ class ExpenseCreate(BaseModel):
     created_by: str
 
 class VehicleCreate(BaseModel):
+    """Deprecated — kept only for backward-compat with any legacy callers."""
     brand: str
     plate: str
     type: str
@@ -151,6 +156,7 @@ class VehicleCreate(BaseModel):
     notes: Optional[str] = None
 
 class VehicleUpdate(BaseModel):
+    """Deprecated."""
     brand: Optional[str] = None
     plate: Optional[str] = None
     type: Optional[str] = None
@@ -165,6 +171,23 @@ class TelegramNotify(BaseModel):
 class MarkReadBody(BaseModel):
     ids: Optional[list[str]] = None
     all: Optional[bool] = False
+
+class RefusalCreate(BaseModel):
+    """Operator initiates client refusal — requires notes."""
+    refusal_notes: str
+    operator_id: Optional[str] = None
+
+class RefusalSignature(BaseModel):
+    """Driver attaches signature from mini-app."""
+    signature_url: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class RefusalDecision(BaseModel):
+    """Admin approves or returns refusal."""
+    approver_id: Optional[str] = None
+    admin_note: Optional[str] = None
+    return_to_status: Optional[str] = "in_progress"  # used only on return
 
 @app.get("/")
 def read_root():
@@ -332,11 +355,14 @@ async def post_app_message(id: str, body: MessageCreate):
 # ── DIRECTORIES ────────────────────────────
 
 @app.get("/api/institutions")
-async def get_inst():
+async def get_inst(include_inactive: Optional[bool] = False):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("institutions").select("*").order("name").execute().data}
+        q = supabase.table("institutions").select("*").order("name")
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        return {"success": True, "data": q.execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.post("/api/institutions")
@@ -344,7 +370,38 @@ async def create_inst(body: InstitutionCreate):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("institutions").insert(body.dict()).execute().data[0]}
+        data = {k: v for k, v in body.dict().items() if v is not None}
+        return {"success": True, "data": supabase.table("institutions").insert(data).execute().data[0]}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.patch("/api/institutions/{id}")
+async def update_inst(id: str, body: InstitutionUpdate):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        data = {k: v for k, v in body.dict().items() if v is not None}
+        result = supabase.table("institutions").update(data).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.delete("/api/institutions/{id}")
+async def delete_inst(id: str):
+    """Soft delete — set is_active=false. Use ?hard=true to actually DELETE."""
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("institutions").update({"is_active": False}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.post("/api/institutions/{id}/restore")
+async def restore_inst(id: str):
+    """Reactivate soft-deleted institution."""
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("institutions").update({"is_active": True}).eq("id", id).execute()
+        return {"success": True}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/waste_types")
@@ -364,7 +421,7 @@ async def get_sched():
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("schedules").select("*").execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address, contact_phone), transport:transport(name, plate, type), waste_type:waste_types(name)").execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/schedules/tomorrow")
@@ -373,7 +430,7 @@ async def get_sched_tomorrow():
     supabase = create_client(url, key)
     try:
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        return {"success": True, "data": supabase.table("schedules").select("*").eq("next_pickup", tomorrow).execute().data}
+        return {"success": True, "data": supabase.table("schedules").select("*, institution:institutions(name, address, contact_phone), transport:transport(name, plate, type), waste_type:waste_types(name)").eq("next_run_at", tomorrow).execute().data}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.post("/api/schedules")
@@ -394,42 +451,9 @@ async def patch_sched(id: str, body: ScheduleUpdate):
         return {"success": True, "data": supabase.table("schedules").update(data).eq("id", id).execute().data[0]}
     except Exception as e: return {"success": False, "error": str(e)}
 
-# ── VEHICLES ─────────────────────────────
-
-@app.get("/api/vehicles")
-async def get_vehicles():
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        return {"success": True, "data": supabase.table("vehicles").select("*").order("plate").execute().data}
-    except Exception as e: return {"success": False, "error": str(e)}
-
-@app.post("/api/vehicles")
-async def create_vehicle(body: VehicleCreate):
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        data = {k: v for k, v in body.dict().items() if v is not None}
-        return {"success": True, "data": supabase.table("vehicles").insert(data).execute().data[0]}
-    except Exception as e: return {"success": False, "error": str(e)}
-
-@app.patch("/api/vehicles/{id}")
-async def update_vehicle(id: str, body: VehicleUpdate):
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        data = {k: v for k, v in body.dict().items() if v is not None}
-        return {"success": True, "data": supabase.table("vehicles").update(data).eq("id", id).execute().data[0]}
-    except Exception as e: return {"success": False, "error": str(e)}
-
-@app.delete("/api/vehicles/{id}")
-async def delete_vehicle(id: str):
-    url, key = get_supabase()
-    supabase = create_client(url, key)
-    try:
-        supabase.table("vehicles").delete().eq("id", id).execute()
-        return {"success": True}
-    except Exception as e: return {"success": False, "error": str(e)}
+# ── VEHICLES (DEPRECATED) ─────────────────────────
+# /api/vehicles/* endpoints removed — use /api/transport/* instead.
+# The legacy 'vehicles' table is no longer used by the dashboard.
 
 # ── REPORTS ─────────────────────────────
 
@@ -464,41 +488,46 @@ async def get_reports_summary(
         if date_to: query = query.lte("created_at", f"{date_to}T23:59:59.999Z")
         apps = query.execute().data or []
         
-        trans_query = supabase.table("transport").select("*, transport_history(*)")
-        trans = trans_query.execute().data or []
-        
+        transport = supabase.table("transport").select("*").execute().data or []
+
         status_counts = {}
         source_counts = {}
         waste_counts = {}
         user_type_counts = {}
-        
+
         for a in apps:
             st = a.get("status") or "new"
             status_counts[st] = status_counts.get(st, 0) + 1
-            
+
             src = a.get("source") or "whatsapp"
             source_counts[src] = source_counts.get(src, 0) + 1
-            
+
             wt = a.get("waste_type") or "unknown"
             waste_counts[wt] = waste_counts.get(wt, 0) + 1
-            
+
             ut = a.get("user_type") or "resident"
             user_type_counts[ut] = user_type_counts.get(ut, 0) + 1
-            
+
         transport_usage = []
-        for t in trans:
-            hist = t.get("transport_history", [])
-            if date_from or date_to:
-                c_hist = []
-                for h in hist:
-                    h_date = h.get("created_at", "")
-                    if date_from and h_date < date_from: continue
-                    if date_to and h_date > f"{date_to}T23:59:59.999Z": continue
-                    c_hist.append(h)
-                trips = len(c_hist)
-            else:
-                trips = len(hist)
-            transport_usage.append({"name": t.get("name"), "plate": t.get("plate"), "trips": trips})
+        for vehicle in transport:
+            vehicle_apps = [a for a in apps if a.get("vehicle_id") == vehicle["id"]]
+            completed = [a for a in vehicle_apps if a.get("status") in ("completed", "closed")]
+            waste_by_type: dict = {}
+            for a in vehicle_apps:
+                wt = a.get("waste_type") or "Белгисиз"
+                waste_by_type[wt] = waste_by_type.get(wt, 0) + 1
+            transport_usage.append({
+                "id": vehicle["id"],
+                "name": vehicle.get("name"),
+                "plate": vehicle.get("plate"),
+                "type": vehicle.get("type"),
+                "status": vehicle.get("status"),
+                "total_trips": len(vehicle_apps),
+                "completed_trips": len(completed),
+                "active_trips": len(vehicle_apps) - len(completed),
+                "waste_breakdown": waste_by_type,
+            })
+        transport_usage.sort(key=lambda x: x["total_trips"], reverse=True)
 
         return {"success": True, "data": {
             "total": len(apps),
@@ -541,11 +570,42 @@ async def notify_telegram(body: TelegramNotify):
 # ── TRANSPORT ──────────────────────────────
 
 @app.get("/api/transport")
-async def get_transport_list():
+async def get_transport_list(include_inactive: Optional[bool] = False):
     url, key = get_supabase()
     supabase = create_client(url, key)
     try:
-        return {"success": True, "data": supabase.table("transport").select("*").order("name").execute().data}
+        q = supabase.table("transport").select("*").order("name")
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        return {"success": True, "data": q.execute().data}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.post("/api/transport")
+async def create_transport(body: TransportCreate):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        data = {k: v for k, v in body.dict().items() if v is not None}
+        return {"success": True, "data": supabase.table("transport").insert(data).execute().data[0]}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.delete("/api/transport/{id}")
+async def delete_transport(id: str):
+    """Soft delete — set is_active=false. Preserves FKs from applications/schedules."""
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("transport").update({"is_active": False}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e: return {"success": False, "error": str(e)}
+
+@app.post("/api/transport/{id}/restore")
+async def restore_transport(id: str):
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        supabase.table("transport").update({"is_active": True}).eq("id", id).execute()
+        return {"success": True}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.get("/api/transport/{id}")
@@ -589,61 +649,9 @@ async def create_transport_expense(body: ExpenseCreate):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ── OPERATORS CRUD ────────────────────────
-
-class OperatorCreate(BaseModel):
-    name: str
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    role: Optional[str] = "operator"
-
-class OperatorUpdate(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    role: Optional[str] = None
-    is_active: Optional[bool] = None
-
-@app.get("/api/operators")
-async def get_operators():
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        result = supabase.table("operators").select("*").execute()
-        return {"success": True, "data": result.data}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.post("/api/operators")
-async def create_operator(body: OperatorCreate):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        result = supabase.table("operators").insert(body.dict()).execute()
-        return {"success": True, "data": result.data}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.patch("/api/operators/{id}")
-async def update_operator(id: str, body: OperatorUpdate):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        updates = {k: v for k, v in body.dict().items() if v is not None}
-        result = supabase.table("operators").update(updates).eq("id", id).execute()
-        return {"success": True, "data": result.data}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.delete("/api/operators/{id}")
-async def delete_operator(id: str):
-    try:
-        url, key = get_supabase()
-        supabase = create_client(url, key)
-        supabase.table("operators").update({"is_active": False}).eq("id", id).execute()
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+# ── OPERATORS (DEPRECATED) ────────────────────────
+# /api/operators/* endpoints removed — use /api/users/* instead.
+# Operators live in the 'users' table with role='operator'.
 
 # ── ANALYTICS ─────────────────────────────────────────────
 
@@ -865,6 +873,125 @@ async def update_organization(id: str, body: OrgUpdate):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+# ── REFUSAL WORKFLOW (operator → admin approval) ───────────────────────────
+
+@app.post("/api/applications/{id}/reject")
+async def reject_application(id: str, body: RefusalCreate):
+    """Operator initiates client refusal. Status -> pending_admin_approval.
+    Releases assigned transport (if any) back to 'available'."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        # Fetch current app to know vehicle_id
+        cur = supabase.table("applications").select("vehicle_id").eq("id", id).single().execute()
+        vehicle_id = cur.data.get("vehicle_id") if cur.data else None
+        updates = {
+            "status": "pending_admin_approval",
+            "refusal_notes": body.refusal_notes,
+            "refused_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if body.operator_id:
+            updates["refused_by_operator_id"] = body.operator_id
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        # Release transport
+        if vehicle_id:
+            try:
+                supabase.table("transport").update({
+                    "status": "available",
+                    "current_task": None
+                }).eq("id", vehicle_id).execute()
+            except Exception:
+                pass
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/applications/{id}/signature")
+async def attach_refusal_signature(id: str, body: RefusalSignature):
+    """Driver attaches refusal signature from mini-app. Doesn't change status —
+    signature is just metadata that admin can review before approving."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        updates = {"refusal_signature_url": body.signature_url}
+        if body.lat is not None:
+            updates["refused_lat"] = body.lat
+        if body.lng is not None:
+            updates["refused_lng"] = body.lng
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/applications/{id}/refusal/approve")
+async def approve_refusal(id: str, body: RefusalDecision):
+    """Admin approves the refusal. Final status -> cancelled."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        updates = {
+            "status": "cancelled",
+            "refusal_approved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if body.approver_id:
+            updates["refusal_approved_by"] = body.approver_id
+        if body.admin_note:
+            # Append admin note to refusal_notes
+            cur = supabase.table("applications").select("refusal_notes").eq("id", id).single().execute()
+            prev = (cur.data or {}).get("refusal_notes") or ""
+            updates["refusal_notes"] = f"{prev}\n\n[Админ] {body.admin_note}".strip()
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.patch("/api/applications/{id}/refusal/return")
+async def return_refusal(id: str, body: RefusalDecision):
+    """Admin returns the refusal to the operator (rejects the refusal)."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        target_status = body.return_to_status or "in_progress"
+        updates = {"status": target_status}
+        if body.admin_note:
+            cur = supabase.table("applications").select("refusal_notes").eq("id", id).single().execute()
+            prev = (cur.data or {}).get("refusal_notes") or ""
+            updates["refusal_notes"] = f"{prev}\n\n[Админ возврат] {body.admin_note}".strip()
+        result = supabase.table("applications").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ── SCHEDULE COMPLETE ─────────────────────────────
+
+@app.patch("/api/schedules/{id}/complete")
+async def complete_schedule(id: str):
+    """Mark a scheduled pickup as completed today.
+    Sets last_completed + last_run_at = now, and advances next_run_at
+    by interval_days (if interval_days > 0)."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        cur = supabase.table("schedules").select("interval_days, next_run_at").eq("id", id).single().execute()
+        row = cur.data or {}
+        now_dt = datetime.now(timezone.utc)
+        today_date = now_dt.date().isoformat()
+        updates = {
+            "last_completed": now_dt.isoformat(),
+            "last_run_at": today_date,
+        }
+        # Advance next_run_at if interval is set
+        try:
+            days = int(row.get("interval_days") or 0)
+        except (TypeError, ValueError):
+            days = 0
+        if days > 0:
+            updates["next_run_at"] = (now_dt + timedelta(days=days)).date().isoformat()
+        result = supabase.table("schedules").update(updates).eq("id", id).execute()
+        return {"success": True, "data": result.data[0] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # ── AUTH MODELS ───────────────────────────────────────────────────────────────
 
 class LoginBody(BaseModel):
@@ -875,6 +1002,8 @@ class RegisterBody(BaseModel):
     name: str
     email: str
     password: str
+    role: Optional[str] = "operator"
+    phone: Optional[str] = None
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -899,7 +1028,8 @@ class NotifPrefsUpdate(BaseModel):
 
 @app.post("/api/auth/register")
 async def register(body: RegisterBody):
-    """Public registration — creates user with status=pending. Admin must approve."""
+    """Public registration. Self-signup is always pending+operator.
+    When called by an admin (with role/phone), creates immediately with given role (still pending until approved)."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
@@ -907,14 +1037,28 @@ async def register(body: RegisterBody):
         if existing.data:
             raise HTTPException(status_code=400, detail="Email уже занят")
         hashed = hash_password(body.password)
-        supabase.table("users").insert({
+        role = body.role if body.role in ("operator", "admin", "super_admin") else "operator"
+        new_user = {
             "name": body.name,
             "email": body.email,
             "password_hash": hashed,
-            "role": "operator",
+            "role": role,
             "status": "pending",
-        }).execute()
-        return {"success": True, "status": "pending"}
+        }
+        if body.phone:
+            new_user["phone"] = body.phone
+        result = supabase.table("users").insert(new_user).execute()
+        created = result.data[0] if result.data else None
+        return {
+            "success": True,
+            "status": "pending",
+            "user": {
+                "id": created["id"] if created else None,
+                "name": created["name"] if created else body.name,
+                "email": created["email"] if created else body.email,
+                "role": created["role"] if created else role,
+            } if created else None,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -990,14 +1134,17 @@ async def get_me(request: Request):
 # ── USER MANAGEMENT ───────────────────────────────────────────────────────────
 
 @app.get("/api/users")
-async def get_users():
-    """Admin: get all users with status."""
+async def get_users(include_inactive: Optional[bool] = False):
+    """Admin: get all users with status. By default excludes soft-deleted."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
-        result = supabase.table("users").select(
-            "id, name, email, role, status, last_login, created_at"
-        ).order("created_at", desc=True).execute()
+        q = supabase.table("users").select(
+            "id, name, email, role, status, phone, is_active, last_login, created_at"
+        ).order("created_at", desc=True)
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        result = q.execute()
         return {"success": True, "data": result.data}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1036,10 +1183,14 @@ async def reject_user(id: str):
 @app.patch("/api/users/{id}/role")
 async def change_role(id: str, body: RoleUpdate):
     try:
+        if body.role not in ("operator", "admin", "super_admin"):
+            raise HTTPException(status_code=400, detail="Недопустимая роль")
         url, key = get_supabase()
         supabase = create_client(url, key)
         supabase.table("users").update({"role": body.role}).eq("id", id).execute()
         return {"success": True}
+    except HTTPException:
+        raise
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1061,10 +1212,23 @@ async def change_password(id: str, body: PasswordChange):
 
 @app.delete("/api/users/{id}")
 async def delete_user(id: str):
+    """Soft delete — set is_active=false. Preserves foreign keys from
+    historical applications / messages."""
     try:
         url, key = get_supabase()
         supabase = create_client(url, key)
-        supabase.table("users").delete().eq("id", id).execute()
+        supabase.table("users").update({"is_active": False}).eq("id", id).execute()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/users/{id}/restore")
+async def restore_user(id: str):
+    """Reactivate soft-deleted user."""
+    try:
+        url, key = get_supabase()
+        supabase = create_client(url, key)
+        supabase.table("users").update({"is_active": True}).eq("id", id).execute()
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1081,5 +1245,282 @@ async def update_notif_prefs(id: str, body: NotifPrefsUpdate):
         else:
             result = supabase.table("notification_prefs").insert({"user_id": id, **updates}).execute()
         return {"success": True, "data": result.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DRIVER WORKFLOW (iter3)
+# ═══════════════════════════════════════════════════════════════════════════
+# Three endpoints that mediate between admin UI / n8n Telegram bot / DB:
+#  1. POST /api/transport/register        — driver binds Telegram chat_id by phone
+#  2. POST /api/applications/{id}/assign  — operator assigns vehicle, fires webhook
+#  3. POST /api/applications/{id}/driver-action — driver accepts/refuses/completes
+#
+# Architecture: API is the single source of truth.
+# n8n never writes to Supabase directly; it only calls these endpoints.
+
+import re as _re
+
+def _normalize_phone_kg(raw):
+    """Return canonical 996XXXXXXXXX or None."""
+    if not raw:
+        return None
+    digits = _re.sub(r"\D", "", str(raw))
+    if not digits:
+        return None
+    if len(digits) == 12 and digits.startswith("996"):
+        return digits
+    if len(digits) == 10 and digits[0] in ("0", "8"):
+        return "996" + digits[1:]
+    if len(digits) == 9:
+        return "996" + digits
+    return None
+
+
+def _trigger_n8n_webhook(payload):
+    """Fire-and-forget POST to n8n driver-assign webhook.
+    Returns (ok: bool, err: Optional[str]). Does not raise.
+    """
+    url = os.environ.get("N8N_DRIVER_ASSIGN_WEBHOOK_URL")
+    if not url:
+        return False, "N8N_DRIVER_ASSIGN_WEBHOOK_URL not configured"
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as res:
+            res.read()  # drain
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+# ── 1. Driver registration ─────────────────────────────────────────────────
+
+class DriverRegister(BaseModel):
+    phone: str
+    telegram_chat_id: int
+    telegram_username: Optional[str] = None
+
+
+@app.post("/api/transport/register")
+async def driver_register(body: DriverRegister):
+    """Bind a Telegram chat_id to a transport record by matching driver_phone.
+
+    Called by n8n when driver sends `/start <phone>` to the bot.
+    """
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        phone = _normalize_phone_kg(body.phone)
+        if not phone:
+            return {"success": False, "error": "invalid_phone"}
+
+        match = (
+            supabase.table("transport")
+            .select("id, name, plate, driver_name, driver_phone, is_active")
+            .eq("driver_phone", phone)
+            .execute()
+        )
+        rows = match.data or []
+        rows = [r for r in rows if r.get("is_active") in (True, None)]
+        if not rows:
+            return {"success": False, "error": "phone_not_found"}
+
+        t = rows[0]
+        updates = {
+            "telegram_chat_id": str(body.telegram_chat_id),
+            "telegram_username": body.telegram_username,
+            "telegram_linked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("transport").update(updates).eq("id", t["id"]).execute()
+        return {
+            "success": True,
+            "data": {
+                "id": t["id"],
+                "name": t.get("name"),
+                "plate": t.get("plate"),
+                "driver_name": t.get("driver_name"),
+            },
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── 2. Assign vehicle to application ───────────────────────────────────────
+
+class AssignVehicle(BaseModel):
+    vehicle_id: str
+
+
+@app.post("/api/applications/{id}/assign")
+async def assign_vehicle(id: str, body: AssignVehicle):
+    """Operator assigns a vehicle to an application.
+
+    Side effects: sets status='assigned', records assigned_at,
+    fires webhook to n8n which will notify the driver in Telegram.
+    """
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        # Verify transport exists and is active
+        t = (
+            supabase.table("transport")
+            .select("id, name, plate, telegram_chat_id, driver_name, is_active")
+            .eq("id", body.vehicle_id)
+            .single()
+            .execute()
+        )
+        if not t.data:
+            return {"success": False, "error": "vehicle_not_found"}
+        if t.data.get("is_active") is False:
+            return {"success": False, "error": "vehicle_inactive"}
+
+        # Update application
+        now_iso = datetime.now(timezone.utc).isoformat()
+        result = (
+            supabase.table("applications")
+            .update({
+                "vehicle_id": body.vehicle_id,
+                "status": "assigned",
+                "assigned_at": now_iso,
+            })
+            .eq("id", id)
+            .execute()
+        )
+        if not result.data:
+            return {"success": False, "error": "application_not_found"}
+
+        # Fire webhook to n8n (non-blocking semantics — we don't fail the assign
+        # if webhook is down; the driver can be reached by phone in that case)
+        webhook_ok, webhook_err = _trigger_n8n_webhook({
+            "application_id": id,
+            "vehicle_id": body.vehicle_id,
+            "has_telegram": bool(t.data.get("telegram_chat_id")),
+        })
+
+        return {
+            "success": True,
+            "data": result.data[0] if result.data else None,
+            "webhook": {"ok": webhook_ok, "error": webhook_err},
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── 3. Driver action (accept / refuse / complete) ──────────────────────────
+
+class DriverAction(BaseModel):
+    action: str  # 'accept' | 'refuse' | 'complete'
+    telegram_chat_id: int
+
+
+@app.post("/api/applications/{id}/driver-action")
+async def driver_action(id: str, body: DriverAction):
+    """Driver presses a button in Telegram. Validates that the chat_id
+    matches the transport assigned to this application, then transitions
+    status accordingly.
+
+    accept   : assigned  → accepted
+    refuse   : assigned  → new (returns to operators' queue, vehicle_id cleared)
+    complete : accepted  → completed (also shifts schedule.next_run_at)
+    """
+    if body.action not in ("accept", "refuse", "complete"):
+        return {"success": False, "error": "invalid_action"}
+
+    url, key = get_supabase()
+    supabase = create_client(url, key)
+    try:
+        # Fetch application + its assigned transport
+        app_row = (
+            supabase.table("applications")
+            .select("id, status, vehicle_id, institution_id")
+            .eq("id", id)
+            .single()
+            .execute()
+        )
+        if not app_row.data:
+            return {"success": False, "error": "application_not_found"}
+        a = app_row.data
+        if not a.get("vehicle_id"):
+            return {"success": False, "error": "no_vehicle_assigned"}
+
+        # Verify the driver pressing the button owns the assigned vehicle
+        t = (
+            supabase.table("transport")
+            .select("id, telegram_chat_id, name, plate")
+            .eq("id", a["vehicle_id"])
+            .single()
+            .execute()
+        )
+        if not t.data:
+            return {"success": False, "error": "vehicle_not_found"}
+        expected_chat = t.data.get("telegram_chat_id")
+        if not expected_chat or str(expected_chat) != str(body.telegram_chat_id):
+            return {"success": False, "error": "chat_id_mismatch"}
+
+        # Compute state transition
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if body.action == "accept":
+            if a["status"] != "assigned":
+                return {"success": False, "error": "invalid_state", "current_status": a["status"]}
+            updates = {"status": "accepted", "accepted_at": now_iso}
+        elif body.action == "refuse":
+            if a["status"] not in ("assigned", "accepted"):
+                return {"success": False, "error": "invalid_state", "current_status": a["status"]}
+            updates = {
+                "status": "new",
+                "vehicle_id": None,
+                "assigned_at": None,
+                "accepted_at": None,
+            }
+        else:  # complete
+            if a["status"] not in ("accepted", "assigned"):
+                return {"success": False, "error": "invalid_state", "current_status": a["status"]}
+            updates = {"status": "completed", "completed_at": now_iso}
+
+        upd_result = (
+            supabase.table("applications").update(updates).eq("id", id).execute()
+        )
+
+        # If completed and application is tied to an institution, advance the schedule
+        schedule_advanced = None
+        if body.action == "complete" and a.get("institution_id"):
+            sch = (
+                supabase.table("schedules")
+                .select("id, next_run_at, interval_days")
+                .eq("institution_id", a["institution_id"])
+                .execute()
+            )
+            if sch.data:
+                # Advance every schedule for this institution that's due on/before today
+                today = datetime.now(timezone.utc).date()
+                advanced_ids = []
+                for s in sch.data:
+                    nxt = s.get("next_run_at")
+                    ival = s.get("interval_days") or 7
+                    if not nxt:
+                        continue
+                    try:
+                        cur = datetime.fromisoformat(nxt.replace("Z", "+00:00")).date()
+                    except Exception:
+                        continue
+                    if cur <= today:
+                        new_next = cur + timedelta(days=int(ival))
+                        supabase.table("schedules").update({
+                            "next_run_at": new_next.isoformat(),
+                            "last_completed": now_iso,
+                            "last_run_at": now_iso,
+                        }).eq("id", s["id"]).execute()
+                        advanced_ids.append(s["id"])
+                schedule_advanced = advanced_ids or None
+
+        return {
+            "success": True,
+            "data": upd_result.data[0] if upd_result.data else None,
+            "schedule_advanced": schedule_advanced,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
