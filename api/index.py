@@ -488,41 +488,46 @@ async def get_reports_summary(
         if date_to: query = query.lte("created_at", f"{date_to}T23:59:59.999Z")
         apps = query.execute().data or []
         
-        trans_query = supabase.table("transport").select("*, transport_history(*)")
-        trans = trans_query.execute().data or []
-        
+        transport = supabase.table("transport").select("*").execute().data or []
+
         status_counts = {}
         source_counts = {}
         waste_counts = {}
         user_type_counts = {}
-        
+
         for a in apps:
             st = a.get("status") or "new"
             status_counts[st] = status_counts.get(st, 0) + 1
-            
+
             src = a.get("source") or "whatsapp"
             source_counts[src] = source_counts.get(src, 0) + 1
-            
+
             wt = a.get("waste_type") or "unknown"
             waste_counts[wt] = waste_counts.get(wt, 0) + 1
-            
+
             ut = a.get("user_type") or "resident"
             user_type_counts[ut] = user_type_counts.get(ut, 0) + 1
-            
+
         transport_usage = []
-        for t in trans:
-            hist = t.get("transport_history", [])
-            if date_from or date_to:
-                c_hist = []
-                for h in hist:
-                    h_date = h.get("created_at", "")
-                    if date_from and h_date < date_from: continue
-                    if date_to and h_date > f"{date_to}T23:59:59.999Z": continue
-                    c_hist.append(h)
-                trips = len(c_hist)
-            else:
-                trips = len(hist)
-            transport_usage.append({"name": t.get("name"), "plate": t.get("plate"), "trips": trips})
+        for vehicle in transport:
+            vehicle_apps = [a for a in apps if a.get("vehicle_id") == vehicle["id"]]
+            completed = [a for a in vehicle_apps if a.get("status") in ("completed", "closed")]
+            waste_by_type: dict = {}
+            for a in vehicle_apps:
+                wt = a.get("waste_type") or "Белгисиз"
+                waste_by_type[wt] = waste_by_type.get(wt, 0) + 1
+            transport_usage.append({
+                "id": vehicle["id"],
+                "name": vehicle.get("name"),
+                "plate": vehicle.get("plate"),
+                "type": vehicle.get("type"),
+                "status": vehicle.get("status"),
+                "total_trips": len(vehicle_apps),
+                "completed_trips": len(completed),
+                "active_trips": len(vehicle_apps) - len(completed),
+                "waste_breakdown": waste_by_type,
+            })
+        transport_usage.sort(key=lambda x: x["total_trips"], reverse=True)
 
         return {"success": True, "data": {
             "total": len(apps),
